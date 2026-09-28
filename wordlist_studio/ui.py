@@ -7,7 +7,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .job import Cancelled, JobControl, run
-from .model import Config, estimate
+from .model import Config, EstimateCancelled, estimate
 
 
 def lines(value: str) -> tuple[str, ...]:
@@ -99,6 +99,7 @@ class App(tk.Tk):
                     self.digits, self.symbols, self.extra, self.exclude, self.combine,
                     self.cases, self.deduplicate, self.compress):
             var.trace_add("write", lambda *_: self._schedule_estimate())
+        self.compress.trace_add("write", lambda *_: self._match_output_extension())
         self.after(200, self._poll)
         self._schedule_estimate()
 
@@ -192,7 +193,8 @@ class App(tk.Tk):
         rules.columnconfigure(0, weight=1)
         rules.columnconfigure(1, weight=1)
         for widget in (self.words, self.subs, self.prefixes, self.suffixes):
-            widget.bind("<KeyRelease>", lambda _e: self._schedule_estimate())
+            widget.edit_modified(False)
+            widget.bind("<<Modified>>", self._rules_modified)
 
         output_frame = ttk.LabelFrame(body, text="Output", padding=12)
         output_frame.pack(fill="x", pady=5)
@@ -251,6 +253,19 @@ class App(tk.Tk):
             self.after_cancel(self._estimate_timer)
         self._estimate_timer = self.after(300, self._estimate)
 
+    def _rules_modified(self, event):
+        widget = event.widget
+        if widget.edit_modified():
+            widget.edit_modified(False)
+            self._schedule_estimate()
+
+    def _match_output_extension(self):
+        path = self.output.get()
+        if path.lower().endswith(".txt") and self.compress.get():
+            self.output.set(path + ".gz")
+        elif path.lower().endswith(".txt.gz") and not self.compress.get():
+            self.output.set(path[:-3])
+
     def _estimate(self):
         try:
             config = self._read()
@@ -262,7 +277,9 @@ class App(tk.Tk):
 
         def work():
             try:
-                result = estimate(config)
+                result = estimate(config, lambda: revision != self.estimate_revision)
+            except EstimateCancelled:
+                return
             except ValueError as exc:
                 result = exc
             self.messages.put(("estimate", (revision, config, result)))
@@ -284,6 +301,8 @@ class App(tk.Tk):
                 self._schedule_estimate()
                 raise ValueError("Please wait for the current estimate, then try again.")
             amount = self.estimate_cache[1]
+            if isinstance(amount, ValueError):
+                raise amount
             if not amount:
                 raise ValueError("No candidates match the selected settings.")
             path = Path(self.output.get()).expanduser()
@@ -357,11 +376,13 @@ class App(tk.Tk):
                 if revision != self.estimate_revision:
                     continue
                 if isinstance(result, ValueError):
+                    self.estimate_cache = (config, result)
                     self.estimate_text.set(f"Configuration  {result}")
                 elif result:
                     self.estimate_cache = (config, result)
                     self.estimate_text.set(f"Estimated candidates before deduplication  {result:,}")
                 else:
+                    self.estimate_cache = (config, 0)
                     self.estimate_text.set("No candidates match the selected settings.")
             elif kind == "progress":
                 self.progress["value"] = 100 * value.processed / value.total
@@ -377,6 +398,9 @@ class App(tk.Tk):
                     self.progress["value"] = 100
                     self.status.set(f"Complete - {value['total_entries']:,} entries, "
                                     f"{value['file_size_bytes']:,} bytes in {value['seconds']:.3f}s")
+                    if "summary_error" in value:
+                        messagebox.showwarning("Summary log failed", "The wordlist was saved, but "
+                                               f"the summary log could not be written.\n{value['summary_error']}")
                 elif kind == "cancelled":
                     self.status.set("Canceled. Temporary output removed.")
                 else:

@@ -22,6 +22,8 @@ No Python packages are required. The `requirements.txt` file is intentionally em
 
 Generation takes place on a background thread. Pause and resume are cooperative. Cancel removes temporary output and leaves an existing destination unchanged. Successful output replaces its destination atomically and creates a `.summary.json` file beside it with settings, entry count, byte size, duration, and completion time. Keep summaries and wordlists secure because they may contain sensitive keywords.
 
+If writing the summary fails after the wordlist has been committed, the interface reports a warning and retains the completed output.
+
 Large exhaustive searches grow exponentially and may require substantial time and disk space. Check the estimate before starting. Throughput depends on storage speed, candidate length, compression, and deduplication.
 
 ## Test and benchmark
@@ -32,6 +34,8 @@ python -m benchmarks.benchmark
 ```
 
 The benchmark generates one million six-character candidates into a temporary directory. It reports plain text and gzip throughput on the current machine. See `benchmarks/RESULTS.md` for a measured run and its environment. The implementation uses `itertools.product` for enumeration, a 64 KiB write buffer, streaming gzip, and an optional SQLite unique index. The background thread keeps the interface responsive. It does not claim multicore speedup for Python candidate generation.
+
+GitHub Actions runs the test suite on Python 3.10 and 3.13 on Linux and Python 3.12 on Windows for each push and pull request.
 
 ## Project layout
 

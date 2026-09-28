@@ -5,10 +5,12 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from random import Random
+from unittest.mock import patch
 
 from wordlist_studio.generator import candidates
 from wordlist_studio.job import Cancelled, JobControl, run
-from wordlist_studio.model import Config, estimate
+from wordlist_studio.model import Config, EstimateCancelled, estimate
 
 
 class GenerationTests(unittest.TestCase):
@@ -79,6 +81,66 @@ class GenerationTests(unittest.TestCase):
             self.assertFalse(worker.is_alive())
             self.assertIsInstance(results[0], Cancelled)
             self.assertFalse(output.exists())
+
+    def test_pause_resume_completes(self):
+        config = Config(min_length=2, max_length=2, lowercase=False, digits=False,
+                        extra_chars="ab")
+        control = JobControl()
+        control.pause()
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "list.txt"
+            results = []
+            worker = threading.Thread(target=lambda: self._record(run, config, output, control, results))
+            worker.start()
+            time.sleep(0.05)
+            self.assertTrue(worker.is_alive())
+            self.assertFalse(output.exists())
+            control.resume()
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(results[0]["total_entries"], 4)
+
+    def test_failed_replace_preserves_original_and_removes_temps(self):
+        config = Config(min_length=1, max_length=1, lowercase=False, digits=False,
+                        extra_chars="ab", deduplicate=True)
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "list.txt"
+            output.write_text("previous\n")
+            with patch("wordlist_studio.output.os.replace", side_effect=OSError("replace denied")):
+                with self.assertRaisesRegex(OSError, "replace denied"):
+                    run(config, output)
+            self.assertEqual(output.read_text(), "previous\n")
+            self.assertEqual(list(Path(folder).iterdir()), [output])
+
+    def test_summary_failure_reports_saved_output(self):
+        config = Config(min_length=1, max_length=1, lowercase=False, digits=False,
+                        extra_chars="a")
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "list.txt"
+            with patch("wordlist_studio.job.write_summary", side_effect=OSError("log denied")):
+                summary = run(config, output)
+            self.assertEqual(output.read_text(), "a\n")
+            self.assertIn("log denied", summary["summary_error"])
+
+    def test_estimate_matches_rule_iterator_for_varied_inputs(self):
+        random = Random(40)
+        for _ in range(100):
+            config = Config(mode="rules", min_length=1, max_length=8,
+                            words=tuple(random.choice(("a", "b", "ab", "B"))
+                                        for _ in range(random.randint(1, 3))),
+                            combine_words=random.choice((False, True)),
+                            substitutions=tuple(random.choice((("a", "@"), ("a", "A"),
+                                                               ("b", "8")))
+                                                for _ in range(random.randint(0, 2))),
+                            prefixes=("1",), suffixes=("b",),
+                            case_variants=random.choice((False, True)),
+                            exclude_chars=random.choice(("", "a", "@", "b")))
+            self.assertEqual(estimate(config), sum(1 for _ in candidates(config)))
+
+    def test_stale_estimate_stops(self):
+        config = Config(mode="rules", words=("a", "b"), combine_words=True)
+        with self.assertRaises(EstimateCancelled):
+            estimate(config, cancelled=lambda: True)
 
     @staticmethod
     def _record(function, config, output, control, results):

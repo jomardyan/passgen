@@ -44,13 +44,16 @@ class JobControl:
     def checkpoint(self):
         if self._cancel.is_set():
             raise Cancelled()
-        began = time.monotonic()
-        while not self._resume.wait(0.1):
-            if self._cancel.is_set():
-                raise Cancelled()
+        paused = 0.0
+        if not self._resume.is_set():
+            began = time.monotonic()
+            while not self._resume.wait(0.1):
+                if self._cancel.is_set():
+                    raise Cancelled()
+            paused = time.monotonic() - began
         if self._cancel.is_set():
             raise Cancelled()
-        return time.monotonic() - began if time.monotonic() - began > 0.1 else 0.0
+        return paused
 
 
 def run(config: Config, path: Path, control: JobControl | None = None,
@@ -92,5 +95,9 @@ def run(config: Config, path: Path, control: JobControl | None = None,
                "seconds": round(duration, 3),
                "finished_at_utc": datetime.now(timezone.utc).isoformat(),
                "output": str(path.resolve())}
-    write_summary(path, config, summary)
+    try:
+        write_summary(path, config, summary)
+    except OSError as exc:
+        # The wordlist is already committed. Report the log failure separately.
+        summary["summary_error"] = str(exc)
     return summary

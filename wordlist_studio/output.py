@@ -19,6 +19,7 @@ class StreamingOutput:
         self.database_path = None
         self.database = None
         self.stream = None
+        self.raw = None
         self.buffer = []
         self.buffer_chars = 0
         self.written = 0
@@ -29,14 +30,17 @@ class StreamingOutput:
             descriptor, name = tempfile.mkstemp(prefix=self.path.name + ".", suffix=".partial",
                                               dir=self.path.parent)
             self.temporary = Path(name)
-            raw = os.fdopen(descriptor, "wb", buffering=1024 * 1024)
+            try:
+                raw = os.fdopen(descriptor, "wb", buffering=1024 * 1024)
+            except Exception:
+                os.close(descriptor)
+                raise
+            self.raw = raw
             if self.config.gzip_output:
                 self.stream = gzip.GzipFile(filename="", mode="wb", fileobj=raw,
                                             compresslevel=3, mtime=0)
-                self.raw = raw
             else:
                 self.stream = raw
-                self.raw = raw
             if self.config.deduplicate:
                 descriptor, name = tempfile.mkstemp(prefix="wordlist-dedup-", suffix=".sqlite",
                                                   dir=self.path.parent)
@@ -49,7 +53,10 @@ class StreamingOutput:
                 self.database.execute("BEGIN")
             return self
         except Exception:
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                pass  # Preserve the setup error after attempting every cleanup step.
             raise
 
     def write(self, candidate: str) -> bool:
@@ -75,33 +82,48 @@ class StreamingOutput:
 
     def finish(self) -> int:
         self.flush()
-        self.stream.close()
-        if self.raw is not self.stream:
-            self.raw.close()
+        try:
+            self.stream.close()
+        finally:
+            if self.raw is not self.stream:
+                self.raw.close()
         self.stream = None
+        self.raw = None
         size = self.temporary.stat().st_size
         os.replace(self.temporary, self.path)
         self.temporary = None
         return size
 
     def close(self):
-        if self.stream is not None:
-            self.stream.close()
-            if self.raw is not self.stream:
-                self.raw.close()
-            self.stream = None
-        if self.database is not None:
-            self.database.close()
-            self.database = None
-        if self.database_path is not None:
-            self.database_path.unlink(missing_ok=True)
-            self.database_path = None
-        if self.temporary is not None:
-            self.temporary.unlink(missing_ok=True)
-            self.temporary = None
+        errors = []
+        resources = (self.stream, self.raw if self.raw is not self.stream else None,
+                     self.database)
+        self.stream = self.raw = self.database = None
+        for resource in resources:
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception as exc:
+                    errors.append(exc)
+        for name in ("database_path", "temporary"):
+            path = getattr(self, name)
+            setattr(self, name, None)
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception as exc:
+                    errors.append(exc)
+        if errors:
+            raise errors[0]
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
+        if exc_type is None:
+            self.close()
+        else:
+            try:
+                self.close()
+            except Exception:
+                pass  # The generation error is more useful than a cleanup error.
 
 
 def write_summary(path: Path, config: Config, statistics: dict) -> Path:

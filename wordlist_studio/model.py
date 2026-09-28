@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from itertools import chain
 from string import ascii_lowercase, ascii_uppercase, digits, punctuation
+from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -77,7 +78,18 @@ def replacement_options(character: str, substitutions: tuple[tuple[str, str], ..
                                             if source == character))))
 
 
-def estimate(config: Config) -> int:
+def allowed_mutations(form: str, config: Config) -> tuple[tuple[str, ...], ...]:
+    """Exclude disallowed characters before expanding the Cartesian product."""
+    excluded = set(config.exclude_chars)
+    return tuple(tuple(value for value in replacement_options(character, config.substitutions)
+                       if value not in excluded) for character in form)
+
+
+class EstimateCancelled(Exception):
+    """An obsolete UI estimate stopped before completing its rule expansion."""
+
+
+def estimate(config: Config, cancelled: Callable[[], bool] | None = None) -> int:
     """Exact emitted iterator steps before optional global deduplication."""
     validate(config)
     if config.mode == "exhaustive":
@@ -87,15 +99,17 @@ def estimate(config: Config) -> int:
     total = 0
     prefixes = ("", *config.prefixes)
     suffixes = ("", *config.suffixes)
+    excluded = set(config.exclude_chars)
     for base in word_bases(config):
+        if cancelled is not None and cancelled():
+            raise EstimateCancelled()
         for form in _case_forms(base, config.case_variants):
             variants = 1
-            for character in form:
-                variants *= sum(char not in config.exclude_chars for char in
-                                replacement_options(character, config.substitutions))
+            for options in allowed_mutations(form, config):
+                variants *= len(options)
             for prefix in prefixes:
                 for suffix in suffixes:
                     if (config.min_length <= len(prefix) + len(form) + len(suffix) <= config.max_length
-                            and not any(char in config.exclude_chars for char in prefix + suffix)):
+                            and not any(char in excluded for char in prefix + suffix)):
                         total += variants
     return total
