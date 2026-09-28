@@ -1,9 +1,11 @@
 """Tkinter and ttk interface. Only the UI thread touches Tk widgets."""
 
 import os
+import json
 import queue
 import threading
 import tkinter as tk
+from dataclasses import asdict
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -100,6 +102,8 @@ class App(tk.Tk):
         self.estimate_cache = None
         self.control = None
         self.worker = None
+        self.settings_path = None
+        self._build_menu()
         self._build()
         for var in (self.mode, self.minimum, self.maximum, self.lowercase, self.uppercase,
                     self.digits, self.symbols, self.extra, self.exclude, self.combine,
@@ -108,6 +112,106 @@ class App(tk.Tk):
         self.compress.trace_add("write", lambda *_: self._match_output_extension())
         self.after(200, self._poll)
         self._schedule_estimate()
+
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+        file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu.add_command(label="Open Settings...", accelerator="Ctrl+O",
+                              command=self._load_settings)
+        file_menu.add_command(label="Save Settings", accelerator="Ctrl+S",
+                              command=self._save_settings)
+        file_menu.add_command(label="Save Settings As...", accelerator="Ctrl+Shift+S",
+                              command=lambda: self._save_settings(save_as=True))
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.close)
+        menubar.add_cascade(label="File", menu=file_menu)
+        self.configure(menu=menubar)
+        self.bind("<Control-o>", lambda _event: self._load_settings())
+        self.bind("<Control-s>", lambda _event: self._save_settings())
+        self.bind("<Control-Shift-S>", lambda _event: self._save_settings(save_as=True))
+
+    def _save_settings(self, save_as=False):
+        try:
+            config = self._read()
+            estimate_output(config)
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("Cannot save settings", str(exc))
+            return
+        path = self.settings_path
+        if save_as or path is None:
+            path = filedialog.asksaveasfilename(
+                title="Save Wordlist Studio settings", defaultextension=".json",
+                initialfile="wordlist-settings.json",
+                filetypes=[("JSON settings", "*.json")])
+        if not path:
+            return
+        try:
+            payload = {"version": 1, "settings": asdict(config), "output": self.output.get()}
+            Path(path).write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                                  encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Cannot save settings", str(exc))
+            return
+        self.settings_path = Path(path)
+        self.status.set(f"Settings saved to {self.settings_path}")
+
+    def _load_settings(self):
+        path = filedialog.askopenfilename(
+            title="Open Wordlist Studio settings",
+            filetypes=[("JSON settings", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                raise ValueError("Unsupported or invalid settings file.")
+            settings = payload.get("settings")
+            if not isinstance(settings, dict):
+                raise ValueError("Settings file has no settings object.")
+            for key in ("words", "prefixes", "suffixes"):
+                if key in settings:
+                    settings[key] = tuple(settings[key])
+            if "substitutions" in settings:
+                settings["substitutions"] = tuple(tuple(pair)
+                                                  for pair in settings["substitutions"])
+            config = Config(**settings)
+            estimate_output(config)
+            output_path = payload.get("output", str(Path.home() / "wordlist.txt"))
+            if not isinstance(output_path, str):
+                raise ValueError("The output path must be text.")
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            messagebox.showerror("Cannot open settings", str(exc))
+            return
+
+        self.mode.set(config.mode)
+        self.minimum.set(str(config.min_length))
+        self.maximum.set(str(config.max_length))
+        self.lowercase.set(config.lowercase)
+        self.uppercase.set(config.uppercase)
+        self.digits.set(config.digits)
+        self.symbols.set(config.symbols)
+        self.extra.set(config.extra_chars)
+        self.exclude.set(config.exclude_chars)
+        self.combine.set(config.combine_words)
+        self.cases.set(config.case_variants)
+        self.deduplicate.set(config.deduplicate)
+        self.compress.set(config.gzip_output)
+        self.workers.set(str(config.workers))
+        self._set_text(self.words, "\n".join(config.words))
+        self._set_text(self.subs, "\n".join(f"{source}={target}"
+                                              for source, target in config.substitutions))
+        self._set_text(self.prefixes, "\n".join(config.prefixes))
+        self._set_text(self.suffixes, "\n".join(config.suffixes))
+        self.output.set(output_path)
+        self.settings_path = Path(path)
+        self.status.set(f"Settings loaded from {self.settings_path}")
+        self._schedule_estimate()
+
+    @staticmethod
+    def _set_text(widget, value):
+        widget.delete("1.0", "end")
+        widget.insert("1.0", value)
+        widget.edit_modified(False)
 
     def _build(self):
         frame = ttk.Frame(self, padding=18)
