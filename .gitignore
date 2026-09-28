@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.partial
+*.sqlite
+*.txt
+*.txt.gz
+!requirements.txt
+*.summary.json
