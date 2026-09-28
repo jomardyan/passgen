@@ -2,8 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from wordlist_studio.model import Config
-from wordlist_studio.ui import App
+from wordlist_studio.model import Config, OutputEstimate
+from wordlist_studio.ui import App, format_duration, format_size, planning_rate
 
 
 class Variable:
@@ -20,7 +20,7 @@ class Variable:
 class UiLogicTests(unittest.TestCase):
     def test_zero_estimate_reports_no_candidates(self):
         config = Config(mode="rules", words=("a",), min_length=4, max_length=4)
-        fake = SimpleNamespace(_read=lambda: config, estimate_cache=(config, 0),
+        fake = SimpleNamespace(_read=lambda: config, estimate_cache=(config, OutputEstimate(0, 0)),
                                _schedule_estimate=Mock())
         with patch("wordlist_studio.ui.messagebox.showerror") as error:
             App._start(fake)
@@ -52,6 +52,14 @@ class UiLogicTests(unittest.TestCase):
         App._rules_modified(fake, SimpleNamespace(widget=widget))
         widget.edit_modified.assert_any_call(False)
         fake._schedule_estimate.assert_called_once()
+
+    def test_estimate_display_helpers(self):
+        self.assertEqual(format_size(1024), "1 KiB")
+        self.assertEqual(format_duration(3_600), "about 1 hour")
+        self.assertEqual(planning_rate(Config(mode="rules", deduplicate=True,
+                                             gzip_output=True)), 100_000)
+        self.assertEqual(planning_rate(Config(deduplicate=True)), 1_000_000)
+        self.assertGreater(planning_rate(Config(workers=4)), planning_rate(Config(workers=1)))
 
 
 if __name__ == "__main__":

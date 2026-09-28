@@ -1,13 +1,15 @@
 """Tkinter and ttk interface. Only the UI thread touches Tk widgets."""
 
+import os
 import queue
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from .display import estimated_file_size, format_duration, format_size, planning_rate
 from .job import Cancelled, JobControl, run
-from .model import Config, EstimateCancelled, estimate
+from .model import Config, EstimateCancelled, estimate_output
 
 
 def lines(value: str) -> tuple[str, ...]:
@@ -85,8 +87,12 @@ class App(tk.Tk):
         self.cases = tk.BooleanVar()
         self.deduplicate = tk.BooleanVar()
         self.compress = tk.BooleanVar()
+        self.workers = tk.StringVar(value=str(min(os.cpu_count() or 1, 8)))
         self.output = tk.StringVar(value=str(Path.home() / "wordlist.txt"))
         self.estimate_text = tk.StringVar(value="")
+        self.estimate_time = tk.StringVar(value="")
+        self.estimate_size = tk.StringVar(value="")
+        self.estimate_note = tk.StringVar(value="")
         self.status = tk.StringVar(value="Ready")
         self.count = tk.StringVar(value="Processed 0 | Written 0 | ETA -")
         self.messages = queue.Queue(maxsize=64)
@@ -97,7 +103,7 @@ class App(tk.Tk):
         self._build()
         for var in (self.mode, self.minimum, self.maximum, self.lowercase, self.uppercase,
                     self.digits, self.symbols, self.extra, self.exclude, self.combine,
-                    self.cases, self.deduplicate, self.compress):
+                    self.cases, self.deduplicate, self.compress, self.workers):
             var.trace_add("write", lambda *_: self._schedule_estimate())
         self.compress.trace_add("write", lambda *_: self._match_output_extension())
         self.after(200, self._poll)
@@ -128,6 +134,11 @@ class App(tk.Tk):
             button = ttk.Radiobutton(options, text=text, value=value, variable=self.mode)
             button.pack(side="left", padx=(0, 20))
             Tip(button, tip)
+        ttk.Label(options, text="Workers").pack(side="left", padx=(0, 6))
+        worker_entry = ttk.Spinbox(options, from_=1, to=32, textvariable=self.workers, width=4)
+        worker_entry.pack(side="left")
+        Tip(worker_entry, "Use separate CPU processes. More workers can speed up large jobs; "
+                          "small jobs may take longer due to startup overhead.")
         lengths = ttk.LabelFrame(body, text="Length and character pool", padding=12)
         lengths.pack(fill="x", pady=5)
         row = ttk.Frame(lengths)
@@ -206,14 +217,18 @@ class App(tk.Tk):
         row = ttk.Frame(output_frame)
         row.pack(fill="x", pady=(8, 0))
         for label, var, tip in (
-            ("Deduplicate on disk", self.deduplicate, "Use a temporary SQLite index. Slower, with bounded memory use."),
+            ("Deduplicate on disk", self.deduplicate,
+             "Uses a temporary SQLite index for keyword rules. Exhaustive candidates are already unique."),
             ("Compress with gzip", self.compress, "Use gzip level 3. The output file must end in .gz."),
         ):
             widget = ttk.Checkbutton(row, text=label, variable=var)
             widget.pack(side="left", padx=(0, 18))
             Tip(widget, tip)
         ttk.Label(body, textvariable=self.estimate_text, font=("TkDefaultFont", 11, "bold"),
-                  wraplength=750).pack(anchor="w", pady=(12, 6))
+                  wraplength=750).pack(anchor="w", pady=(12, 3))
+        ttk.Label(body, textvariable=self.estimate_time).pack(anchor="w", pady=2)
+        ttk.Label(body, textvariable=self.estimate_size, wraplength=750).pack(anchor="w", pady=2)
+        ttk.Label(body, textvariable=self.estimate_note, wraplength=750).pack(anchor="w", pady=(2, 8))
         self.progress = ttk.Progressbar(body, maximum=100)
         self.progress.pack(fill="x")
         ttk.Label(body, textvariable=self.count).pack(anchor="w", pady=5)
@@ -232,8 +247,9 @@ class App(tk.Tk):
     def _read(self):
         try:
             minimum, maximum = int(self.minimum.get()), int(self.maximum.get())
+            workers = int(self.workers.get())
         except ValueError as exc:
-            raise ValueError("Minimum and maximum lengths must be whole numbers.") from exc
+            raise ValueError("Lengths and workers must be whole numbers.") from exc
         return Config(mode=self.mode.get(), min_length=minimum, max_length=maximum,
                       lowercase=self.lowercase.get(), uppercase=self.uppercase.get(),
                       digits=self.digits.get(), symbols=self.symbols.get(),
@@ -244,11 +260,15 @@ class App(tk.Tk):
                       prefixes=lines(self.prefixes.get("1.0", "end-1c")),
                       suffixes=lines(self.suffixes.get("1.0", "end-1c")),
                       case_variants=self.cases.get(), deduplicate=self.deduplicate.get(),
-                      gzip_output=self.compress.get())
+                      gzip_output=self.compress.get(), workers=workers)
 
     def _schedule_estimate(self):
         self.estimate_revision += 1
         self.estimate_cache = None
+        self.estimate_text.set("Updating estimates...")
+        self.estimate_time.set("")
+        self.estimate_size.set("")
+        self.estimate_note.set("")
         if hasattr(self, "_estimate_timer"):
             self.after_cancel(self._estimate_timer)
         self._estimate_timer = self.after(300, self._estimate)
@@ -271,13 +291,16 @@ class App(tk.Tk):
             config = self._read()
         except ValueError as exc:
             self.estimate_text.set(f"Configuration  {exc}")
+            self.estimate_time.set("")
+            self.estimate_size.set("")
+            self.estimate_note.set("")
             return
         revision = self.estimate_revision
-        self.estimate_text.set("Estimating candidates...")
+        self.estimate_text.set("Estimating candidates and output size...")
 
         def work():
             try:
-                result = estimate(config, lambda: revision != self.estimate_revision)
+                result = estimate_output(config, lambda: revision != self.estimate_revision)
             except EstimateCancelled:
                 return
             except ValueError as exc:
@@ -300,10 +323,10 @@ class App(tk.Tk):
             if self.estimate_cache is None or self.estimate_cache[0] != config:
                 self._schedule_estimate()
                 raise ValueError("Please wait for the current estimate, then try again.")
-            amount = self.estimate_cache[1]
-            if isinstance(amount, ValueError):
-                raise amount
-            if not amount:
+            result = self.estimate_cache[1]
+            if isinstance(result, ValueError):
+                raise result
+            if not result.candidates:
                 raise ValueError("No candidates match the selected settings.")
             path = Path(self.output.get()).expanduser()
             if not str(self.output.get()).strip():
@@ -313,7 +336,8 @@ class App(tk.Tk):
             ):
                 raise ValueError("Use .gz with compression or .txt for plain text.")
             if path.exists() and not messagebox.askyesno("Replace output", f"Replace {path}?\n"
-                                                         "The existing file is kept if generation fails or is canceled."):
+                                                         "It will be overwritten when generation starts. "
+                                                         "Partial output remains if canceled or interrupted."):
                 return
         except ValueError as exc:
             messagebox.showerror("Invalid configuration", str(exc))
@@ -340,10 +364,10 @@ class App(tk.Tk):
             try:
                 summary = run(config, path, self.control, lambda value: post("progress", value))
                 post("done", summary)
-            except Cancelled:
-                post("cancelled", None)
+            except Cancelled as exc:
+                post("cancelled", getattr(exc, "output_path", None))
             except Exception as exc:
-                post("error", str(exc))
+                post("error", (str(exc), getattr(exc, "output_path", None)))
 
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
@@ -378,12 +402,29 @@ class App(tk.Tk):
                 if isinstance(result, ValueError):
                     self.estimate_cache = (config, result)
                     self.estimate_text.set(f"Configuration  {result}")
-                elif result:
+                    self.estimate_time.set("")
+                    self.estimate_size.set("")
+                    self.estimate_note.set("")
+                elif result.candidates:
                     self.estimate_cache = (config, result)
-                    self.estimate_text.set(f"Estimated candidates before deduplication  {result:,}")
+                    self.estimate_text.set(
+                        f"Estimated candidates before deduplication  {result.candidates:,}")
+                    rate = planning_rate(config)
+                    seconds = (result.candidates + rate - 1) // rate
+                    self.estimate_time.set(f"Estimated generation time  {format_duration(seconds)}")
+                    self.estimate_size.set(
+                        f"Estimated final file size  {estimated_file_size(config, result)}")
+                    note = (f"Time assumes {rate:,} candidates/s. Actual speed and gzip size "
+                            "vary with hardware, storage, and content.")
+                    if config.mode == "exhaustive" and config.deduplicate:
+                        note += " Disk deduplication is skipped because exhaustive output is unique."
+                    self.estimate_note.set(note)
                 else:
-                    self.estimate_cache = (config, 0)
+                    self.estimate_cache = (config, result)
                     self.estimate_text.set("No candidates match the selected settings.")
+                    self.estimate_time.set("")
+                    self.estimate_size.set("")
+                    self.estimate_note.set("")
             elif kind == "progress":
                 self.progress["value"] = 100 * value.processed / value.total
                 eta = f"{value.eta:.0f}s" if value.eta is not None else "-"
@@ -402,15 +443,18 @@ class App(tk.Tk):
                         messagebox.showwarning("Summary log failed", "The wordlist was saved, but "
                                                f"the summary log could not be written.\n{value['summary_error']}")
                 elif kind == "cancelled":
-                    self.status.set("Canceled. Temporary output removed.")
+                    self.status.set(f"Canceled. Partial output saved to {value}." if value else
+                                    "Canceled before output was created.")
                 else:
-                    self.status.set("Generation failed.")
-                    messagebox.showerror("Generation failed", value)
+                    error, partial_path = value
+                    self.status.set(f"Generation failed. Partial output saved to {partial_path}."
+                                    if partial_path else "Generation failed before output was created.")
+                    messagebox.showerror("Generation failed", error)
         self.after(200, self._poll)
 
     def close(self):
         if self.worker is not None and self.worker.is_alive():
-            if not messagebox.askyesno("Exit", "Cancel generation and close after cleanup?"):
+            if not messagebox.askyesno("Exit", "Cancel generation and close? Partial output will remain saved."):
                 return
             self.control.cancel()
             self.status.set("Canceling. Waiting for cleanup.")

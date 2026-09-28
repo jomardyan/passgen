@@ -25,6 +25,7 @@ class Config:
     case_variants: bool = False
     deduplicate: bool = False
     gzip_output: bool = False
+    workers: int = 1
 
 
 def alphabet(config: Config) -> str:
@@ -38,11 +39,18 @@ def alphabet(config: Config) -> str:
     return "".join(dict.fromkeys(c for c in groups if c not in config.exclude_chars))
 
 
+def needs_deduplication(config: Config) -> bool:
+    """Exhaustive products of a unique alphabet cannot contain duplicates."""
+    return config.deduplicate and config.mode == "rules"
+
+
 def validate(config: Config) -> None:
     if config.mode not in ("exhaustive", "rules"):
         raise ValueError("Select exhaustive or rule based generation.")
     if not (1 <= config.min_length <= config.max_length <= 32):
         raise ValueError("Lengths must satisfy 1 <= minimum <= maximum <= 32.")
+    if not (1 <= config.workers <= 32):
+        raise ValueError("Workers must be between 1 and 32.")
     if any("\n" in value or "\r" in value for value in (
         config.extra_chars, config.exclude_chars, *config.words, *config.prefixes,
         *config.suffixes, *(item for pair in config.substitutions for item in pair),
@@ -89,14 +97,30 @@ class EstimateCancelled(Exception):
     """An obsolete UI estimate stopped before completing its rule expansion."""
 
 
-def estimate(config: Config, cancelled: Callable[[], bool] | None = None) -> int:
-    """Exact emitted iterator steps before optional global deduplication."""
+@dataclass(frozen=True)
+class OutputEstimate:
+    candidates: int
+    plain_bytes: int
+
+
+def estimate_output(config: Config, cancelled: Callable[[], bool] | None = None) -> OutputEstimate:
+    """Exact candidate count and UTF-8 output bytes before optional deduplication."""
     validate(config)
     if config.mode == "exhaustive":
-        size = len(alphabet(config))
-        return sum(size ** length for length in range(config.min_length, config.max_length + 1))
+        pool = alphabet(config)
+        size = len(pool)
+        character_bytes = sum(len(char.encode("utf-8")) for char in pool)
+        counts = ((length, size ** length) for length in
+                  range(config.min_length, config.max_length + 1))
+        total = 0
+        plain_bytes = 0
+        for length, count in counts:
+            total += count
+            plain_bytes += count + length * size ** (length - 1) * character_bytes
+        return OutputEstimate(total, plain_bytes)
 
     total = 0
+    plain_bytes = 0
     prefixes = ("", *config.prefixes)
     suffixes = ("", *config.suffixes)
     excluded = set(config.exclude_chars)
@@ -105,11 +129,25 @@ def estimate(config: Config, cancelled: Callable[[], bool] | None = None) -> int
             raise EstimateCancelled()
         for form in _case_forms(base, config.case_variants):
             variants = 1
+            option_bytes = []
             for options in allowed_mutations(form, config):
                 variants *= len(options)
+                option_bytes.append((len(options), sum(len(value.encode("utf-8"))
+                                                       for value in options)))
+            if not variants:
+                continue
+            mutated_bytes = sum(byte_count * (variants // option_count)
+                                for option_count, byte_count in option_bytes)
             for prefix in prefixes:
                 for suffix in suffixes:
                     if (config.min_length <= len(prefix) + len(form) + len(suffix) <= config.max_length
                             and not any(char in excluded for char in prefix + suffix)):
                         total += variants
-    return total
+                        plain_bytes += mutated_bytes + variants * (
+                            len(prefix.encode("utf-8")) + len(suffix.encode("utf-8")) + 1)
+    return OutputEstimate(total, plain_bytes)
+
+
+def estimate(config: Config, cancelled: Callable[[], bool] | None = None) -> int:
+    """Exact emitted iterator steps before optional global deduplication."""
+    return estimate_output(config, cancelled).candidates

@@ -1,4 +1,4 @@
-"""Atomic streaming output and bounded, disk backed deduplication."""
+"""Direct streaming output and bounded, disk backed deduplication."""
 
 import gzip
 import json
@@ -8,14 +8,13 @@ import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
-from .model import Config
+from .model import Config, needs_deduplication
 
 
 class StreamingOutput:
     def __init__(self, path: Path, config: Config):
         self.path = Path(path)
         self.config = config
-        self.temporary = None
         self.database_path = None
         self.database = None
         self.stream = None
@@ -27,21 +26,7 @@ class StreamingOutput:
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            descriptor, name = tempfile.mkstemp(prefix=self.path.name + ".", suffix=".partial",
-                                              dir=self.path.parent)
-            self.temporary = Path(name)
-            try:
-                raw = os.fdopen(descriptor, "wb", buffering=1024 * 1024)
-            except Exception:
-                os.close(descriptor)
-                raise
-            self.raw = raw
-            if self.config.gzip_output:
-                self.stream = gzip.GzipFile(filename="", mode="wb", fileobj=raw,
-                                            compresslevel=3, mtime=0)
-            else:
-                self.stream = raw
-            if self.config.deduplicate:
+            if needs_deduplication(self.config):
                 descriptor, name = tempfile.mkstemp(prefix="wordlist-dedup-", suffix=".sqlite",
                                                   dir=self.path.parent)
                 os.close(descriptor)
@@ -51,6 +36,12 @@ class StreamingOutput:
                 self.database.execute("PRAGMA synchronous=OFF")
                 self.database.execute("CREATE TABLE seen (candidate TEXT PRIMARY KEY) WITHOUT ROWID")
                 self.database.execute("BEGIN")
+            self.raw = self.path.open("wb", buffering=1024 * 1024)
+            if self.config.gzip_output:
+                self.stream = gzip.GzipFile(filename="", mode="wb", fileobj=self.raw,
+                                            compresslevel=3, mtime=0)
+            else:
+                self.stream = self.raw
             return self
         except Exception:
             try:
@@ -71,6 +62,14 @@ class StreamingOutput:
             self.flush()
         return True
 
+    def write_batch(self, data: bytes, count: int) -> None:
+        """Write already encoded lines when deduplication is disabled."""
+        if self.database is not None:
+            raise ValueError("Encoded batches cannot be deduplicated.")
+        self.flush()
+        self.stream.write(data)
+        self.written += count
+
     def flush(self):
         if self.buffer:
             self.stream.write(("\n".join(self.buffer) + "\n").encode("utf-8"))
@@ -81,21 +80,16 @@ class StreamingOutput:
             self.database.execute("BEGIN")
 
     def finish(self) -> int:
-        self.flush()
-        try:
-            self.stream.close()
-        finally:
-            if self.raw is not self.stream:
-                self.raw.close()
-        self.stream = None
-        self.raw = None
-        size = self.temporary.stat().st_size
-        os.replace(self.temporary, self.path)
-        self.temporary = None
-        return size
+        self.close()
+        return self.path.stat().st_size
 
     def close(self):
         errors = []
+        if self.stream is not None:
+            try:
+                self.flush()
+            except Exception as exc:
+                errors.append(exc)
         resources = (self.stream, self.raw if self.raw is not self.stream else None,
                      self.database)
         self.stream = self.raw = self.database = None
@@ -105,14 +99,13 @@ class StreamingOutput:
                     resource.close()
                 except Exception as exc:
                     errors.append(exc)
-        for name in ("database_path", "temporary"):
-            path = getattr(self, name)
-            setattr(self, name, None)
-            if path is not None:
-                try:
-                    path.unlink(missing_ok=True)
-                except Exception as exc:
-                    errors.append(exc)
+        path = self.database_path
+        self.database_path = None
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception as exc:
+                errors.append(exc)
         if errors:
             raise errors[0]
 
@@ -127,7 +120,7 @@ class StreamingOutput:
 
 
 def write_summary(path: Path, config: Config, statistics: dict) -> Path:
-    """Create a sidecar JSON summary only after successful output commit."""
+    """Create a sidecar JSON summary after successful output completion."""
     sidecar = Path(str(path) + ".summary.json")
     descriptor, name = tempfile.mkstemp(prefix=sidecar.name + ".", dir=sidecar.parent)
     try:
